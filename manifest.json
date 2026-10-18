@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Session Capsule",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Save, organize, and restore your tab sessions directly from the browser sidebar.",
   "permissions": [
     "tabs",
