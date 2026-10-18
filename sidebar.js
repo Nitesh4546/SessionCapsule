@@ -23,6 +23,19 @@ const clearAllBtn = document.getElementById('clear-all-btn');
 const toastContainer = document.getElementById('toast-container');
 const sessionTagsInput = document.getElementById('session-tags-input');
 const searchInput = document.getElementById('search-input');
+const appMain = document.querySelector('.app-main');
+const themeSelect = document.getElementById('theme-select');
+
+// Apply Theme Mode (system, light, dark)
+function applyTheme(theme) {
+  const root = document.documentElement;
+  root.classList.remove('theme-light', 'theme-dark');
+  if (theme === 'light') {
+    root.classList.add('theme-light');
+  } else if (theme === 'dark') {
+    root.classList.add('theme-dark');
+  }
+}
 
 // Initialize Sidebar
 document.addEventListener('DOMContentLoaded', () => {
@@ -37,30 +50,62 @@ async function initApp() {
 
   // Load data from chrome.storage.local (with preview fallback)
   if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-    chrome.storage.local.get(['saved_sessions', 'max_sessions', 'schedules'], (result) => {
-      if (result.saved_sessions) {
-        let modified = false;
-        savedSessions = result.saved_sessions.map((session) => {
-          const cleaned = cleanSessionTabs(session.tabs || [], dedupeOnSave);
-          if (cleaned.length !== (session.tabs || []).length) {
-            modified = true;
-            return { ...session, tabs: cleaned };
+    chrome.storage.local.get(['saved_sessions', 'max_sessions', 'theme', 'schedules'], (result) => {
+      if (chrome.runtime.lastError) {
+        console.error("Error reading storage on startup:", chrome.runtime.lastError);
+        return;
+      }
+
+      // Safe, non-destructive read with old-format tolerance
+      // Existing stored sessions are NEVER modified or stripped on startup
+      if (result && result.saved_sessions !== undefined) {
+        let needsIdPersistence = false;
+        savedSessions = (Array.isArray(result.saved_sessions) ? result.saved_sessions : []).map((session, index) => {
+          if (!session || typeof session !== 'object') return null;
+          let id = session.id;
+          if (!id) {
+            id = 'session_' + (session.timestamp || Date.now()) + '_' + index;
+            needsIdPersistence = true;
           }
-          return session;
-        });
-        if (modified) {
+          return {
+            ...session,
+            id: id,
+            name: (typeof session.name === 'string' && session.name.trim()) ? session.name.trim() : 'Untitled session',
+            timestamp: (typeof session.timestamp === 'number' && !isNaN(session.timestamp)) ? session.timestamp : Date.now(),
+            tags: Array.isArray(session.tags) ? session.tags : [],
+            tabs: Array.isArray(session.tabs) ? session.tabs.map(t => {
+              if (!t || typeof t !== 'object') {
+                return { title: 'Untitled Tab', url: '', favIconUrl: '' };
+              }
+              return {
+                title: (typeof t.title === 'string' && t.title.trim()) ? t.title.trim() : (t.url || 'Untitled Tab'),
+                url: typeof t.url === 'string' ? t.url : '',
+                favIconUrl: typeof t.favIconUrl === 'string' ? t.favIconUrl : ''
+              };
+            }) : []
+          };
+        }).filter(Boolean);
+
+        // Only persist if a session.id was genuinely missing, preserving all sessions and tabs untouched
+        if (needsIdPersistence) {
           chrome.storage.local.set({ saved_sessions: savedSessions });
         }
       }
-      if (result.max_sessions !== undefined) {
+
+      if (result && result.max_sessions !== undefined) {
         maxSessionsLimit = parseInt(result.max_sessions, 10);
+        if (isNaN(maxSessionsLimit) || maxSessionsLimit < 1) maxSessionsLimit = 10;
         maxSessionsInput.value = maxSessionsLimit;
-      } else {
-        // Default setup
-        chrome.storage.local.set({ max_sessions: maxSessionsLimit });
       }
 
-      schedules = result.schedules || [];
+      // Theme setup
+      const savedTheme = (result && result.theme) || 'system';
+      if (themeSelect) {
+        themeSelect.value = savedTheme;
+      }
+      applyTheme(savedTheme);
+
+      schedules = (result && Array.isArray(result.schedules)) ? result.schedules : [];
       
       renderSessions();
     });
@@ -101,6 +146,16 @@ function setupEventListeners() {
   // Settings: Max Sessions Change
   maxSessionsInput.addEventListener('change', handleMaxSessionsChange);
 
+  // Settings: Theme Change
+  if (themeSelect) {
+    themeSelect.addEventListener('change', (e) => {
+      const selectedTheme = e.target.value;
+      chrome.storage.local.set({ theme: selectedTheme }, () => {
+        applyTheme(selectedTheme);
+        showToast(`Theme set to ${selectedTheme === 'system' ? 'System Default' : selectedTheme === 'light' ? 'Light Mode' : 'Dark Mode'}.`, 'success');
+      });
+    });
+  }
 
   // Settings: Reset All
   clearAllBtn.addEventListener('click', handleClearAll);
@@ -117,7 +172,6 @@ function setupEventListeners() {
     renderSessions();
   });
 
-
   if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
@@ -126,8 +180,29 @@ function setupEventListeners() {
         renderSessions();
       }
       if (changes.saved_sessions) {
-        savedSessions = changes.saved_sessions.newValue || [];
-        renderSessions();
+        if (changes.saved_sessions.newValue !== undefined) {
+          savedSessions = (Array.isArray(changes.saved_sessions.newValue) ? changes.saved_sessions.newValue : []).map((session, index) => {
+            if (!session || typeof session !== 'object') return null;
+            return {
+              ...session,
+              id: session.id || ('session_' + (session.timestamp || Date.now()) + '_' + index),
+              name: (typeof session.name === 'string' && session.name.trim()) ? session.name.trim() : 'Untitled session',
+              timestamp: (typeof session.timestamp === 'number' && !isNaN(session.timestamp)) ? session.timestamp : Date.now(),
+              tags: Array.isArray(session.tags) ? session.tags : [],
+              tabs: Array.isArray(session.tabs) ? session.tabs.map(t => ({
+                title: (t && typeof t.title === 'string' && t.title.trim()) ? t.title.trim() : ((t && t.url) || 'Untitled Tab'),
+                url: (t && typeof t.url === 'string') ? t.url : '',
+                favIconUrl: (t && typeof t.favIconUrl === 'string') ? t.favIconUrl : ''
+              })) : []
+            };
+          }).filter(Boolean);
+          renderSessions();
+        }
+      }
+      if (changes.theme) {
+        const newTheme = changes.theme.newValue || 'system';
+        if (themeSelect) themeSelect.value = newTheme;
+        applyTheme(newTheme);
       }
     });
   }
@@ -568,9 +643,19 @@ function renderSessions() {
   emptyState.classList.add('hidden');
   sessionsList.classList.remove('hidden');
 
-  // Remember currently expanded session cards so re-rendering keeps them open
+  // Save current scroll positions before re-rendering
+  const prevMainScrollTop = appMain ? appMain.scrollTop : 0;
+  const detailsScrollMap = new Map();
+
+  // Remember currently expanded session cards and their scroll positions
   document.querySelectorAll('.session-card.expanded').forEach(el => {
-    if (el.dataset.id) expandedSessionIds.add(el.dataset.id);
+    if (el.dataset.id) {
+      expandedSessionIds.add(el.dataset.id);
+      const details = el.querySelector('.session-card-details');
+      if (details) {
+        detailsScrollMap.set(el.dataset.id, details.scrollTop);
+      }
+    }
   });
 
   // Clear existing items
@@ -737,6 +822,9 @@ function renderSessions() {
     // Session Details Accordion
     const cardDetails = document.createElement('div');
     cardDetails.className = 'session-card-details';
+    if (expandedSessionIds.has(session.id)) {
+      cardDetails.style.transition = 'none';
+    }
     
     const tabList = document.createElement('ul');
     tabList.className = 'tab-list';
@@ -901,6 +989,34 @@ function renderSessions() {
     card.appendChild(schedulePanel);
     card.appendChild(cardDetails);
     sessionsList.appendChild(card);
+  });
+
+  // Restore scroll positions for .app-main and each expanded .session-card-details
+  const restoreScrollPositions = () => {
+    if (appMain) {
+      const maxMainScroll = Math.max(0, appMain.scrollHeight - appMain.clientHeight);
+      appMain.scrollTop = Math.min(prevMainScrollTop, maxMainScroll);
+    }
+    detailsScrollMap.forEach((savedScrollTop, sid) => {
+      const card = sessionsList.querySelector(`.session-card[data-id="${sid}"]`);
+      if (card) {
+        const details = card.querySelector('.session-card-details');
+        if (details) {
+          const maxScroll = Math.max(0, details.scrollHeight - details.clientHeight);
+          details.scrollTop = Math.min(savedScrollTop, maxScroll);
+        }
+      }
+    });
+  };
+
+  // Restore immediately before paint
+  restoreScrollPositions();
+  // Also restore in requestAnimationFrame to ensure accurate clamping after layout calculations
+  requestAnimationFrame(() => {
+    restoreScrollPositions();
+    sessionsList.querySelectorAll('.session-card.expanded .session-card-details').forEach(details => {
+      details.style.transition = '';
+    });
   });
 }
 

@@ -8,15 +8,141 @@ if (typeof chrome !== 'undefined' && chrome.sidePanel && chrome.sidePanel.setPan
     .catch((error) => {
       console.error("Error setting side panel behavior:", error);
     });
+} else if (typeof browser !== 'undefined' && browser.sidebarAction && browser.sidebarAction.toggle) {
+  // Firefox desktop: toggle sidebar on action click
+  browser.action.onClicked.addListener(() => {
+    browser.sidebarAction.toggle();
+  });
 } else if (typeof chrome !== 'undefined' && chrome.action && chrome.action.setPopup) {
   // Mobile / Firefox Android fallback: use popup since side panel is unavailable
   chrome.action.setPopup({ popup: 'sidebar.html' });
 }
 
+// One-time safe data migration on extension update
+function migrateDataOnUpdate(callback) {
+  try {
+    chrome.storage.local.get(['schema_version', 'saved_sessions', 'max_sessions', 'theme', 'schedules'], (result) => {
+      try {
+        if (chrome.runtime.lastError) {
+          console.error("Migration read error:", chrome.runtime.lastError);
+          if (callback) callback();
+          return;
+        }
+
+        const currentSchemaVersion = result.schema_version || 1;
+        if (currentSchemaVersion >= 2) {
+          if (callback) callback();
+          return;
+        }
+
+        let hasChanges = false;
+        const updates = {};
+
+        // Migrate saved_sessions: fill missing fields only, never delete or reorder
+        if (Array.isArray(result.saved_sessions)) {
+          const migratedSessions = result.saved_sessions.map((session, index) => {
+            if (!session || typeof session !== 'object') return session;
+            let sessionChanged = false;
+            const updated = { ...session };
+
+            if (!updated.id) {
+              updated.id = 'session_' + (updated.timestamp || Date.now()) + '_' + index;
+              sessionChanged = true;
+            }
+            if (typeof updated.name !== 'string' || !updated.name.trim()) {
+              updated.name = 'Untitled session';
+              sessionChanged = true;
+            }
+            if (typeof updated.timestamp !== 'number' || isNaN(updated.timestamp)) {
+              updated.timestamp = Date.now();
+              sessionChanged = true;
+            }
+            if (!Array.isArray(updated.tags)) {
+              updated.tags = [];
+              sessionChanged = true;
+            }
+            if (!Array.isArray(updated.tabs)) {
+              updated.tabs = [];
+              sessionChanged = true;
+            } else {
+              const updatedTabs = updated.tabs.map((tab) => {
+                if (!tab || typeof tab !== 'object') {
+                  sessionChanged = true;
+                  return { title: 'Untitled Tab', url: '', favIconUrl: '' };
+                }
+                const tTitle = (typeof tab.title === 'string' && tab.title.trim()) ? tab.title.trim() : (tab.url || 'Untitled Tab');
+                const tUrl = typeof tab.url === 'string' ? tab.url : '';
+                const tFav = typeof tab.favIconUrl === 'string' ? tab.favIconUrl : '';
+                if (tab.title !== tTitle || tab.url !== tUrl || tab.favIconUrl !== tFav) {
+                  sessionChanged = true;
+                  return { ...tab, title: tTitle, url: tUrl, favIconUrl: tFav };
+                }
+                return tab;
+              });
+              updated.tabs = updatedTabs;
+            }
+
+            if (sessionChanged) {
+              hasChanges = true;
+            }
+            return updated;
+          });
+
+          if (hasChanges) {
+            updates.saved_sessions = migratedSessions;
+          }
+        }
+
+        // max_sessions check
+        if (result.max_sessions === undefined) {
+          updates.max_sessions = 10;
+          hasChanges = true;
+        }
+
+        // theme check
+        if (!result.theme) {
+          updates.theme = 'system';
+          hasChanges = true;
+        }
+
+        // schedules check
+        if (!Array.isArray(result.schedules)) {
+          updates.schedules = [];
+          hasChanges = true;
+        }
+
+        // Record schema version 2 so migration runs once
+        updates.schema_version = 2;
+
+        chrome.storage.local.set(updates, () => {
+          if (chrome.runtime.lastError) {
+            console.error("Migration write error:", chrome.runtime.lastError);
+          } else {
+            console.log("Session Capsule update migration completed safely.");
+          }
+          if (callback) callback();
+        });
+      } catch (err) {
+        console.error("Error during migration execution:", err);
+        if (callback) callback();
+      }
+    });
+  } catch (err) {
+    console.error("Error initiating migration:", err);
+    if (callback) callback();
+  }
+}
+
 // Log confirmation when the extension is loaded or updated
 chrome.runtime.onInstalled.addListener((details) => {
   console.log("Session Capsule extension installed/updated. Reason:", details.reason);
-  syncAlarms();
+  if (details.reason === 'update') {
+    migrateDataOnUpdate(() => {
+      syncAlarms();
+    });
+  } else {
+    syncAlarms();
+  }
 });
 
 // ---- Scheduled session restoration ----
@@ -65,10 +191,14 @@ function restoreSessionWindow(session, scheduleId = null) {
     .map((t) => t.url)
     .filter((u) => u && !/^(chrome|chrome-extension|edge|devtools|about):/i.test(u));
 
-  if (urls.length > 0) {
-    chrome.windows.create({ url: urls });
-  } else {
-    chrome.windows.create({});
+  if (typeof chrome.windows !== 'undefined' && chrome.windows && chrome.windows.create) {
+    if (urls.length > 0) {
+      chrome.windows.create({ url: urls });
+    } else {
+      chrome.windows.create({});
+    }
+  } else if (typeof chrome.tabs !== 'undefined' && chrome.tabs && chrome.tabs.create) {
+    urls.forEach((u) => chrome.tabs.create({ url: u }));
   }
 }
 
